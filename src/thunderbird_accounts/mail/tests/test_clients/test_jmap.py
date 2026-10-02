@@ -1,17 +1,19 @@
 import json
 from pathlib import Path
 from typing import Literal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from django.test import SimpleTestCase, override_settings
 
 from thunderbird_accounts.mail.clients.jmap_client import JMAPClient
 from thunderbird_accounts.mail.clients.mail_client_jmap import MailClientAdminJMAP
+from thunderbird_accounts.mail.exceptions import DomainNotFoundError
 from thunderbird_accounts.mail.tests.test_clients.test_legacy import (
     TestMailClientCheckDomainDNS,
 )
 from thunderbird_accounts.mail.types.jmap import Invocation, JMapRequest, JMapResponse, SessionResource
 from thunderbird_accounts.mail.types import stalwart
+from thunderbird_accounts.mail.types.stalwart import StalwartMethods
 
 
 class MockJMapClient(JMAPClient):
@@ -133,3 +135,55 @@ class TestCreateDkim(SimpleTestCase):
 
         self.assertIsNotNone(response_data)
         self.assertEqual(3, requests_mock.call_count)
+
+
+class TestDeleteDomain(SimpleTestCase):
+    def setUp(self):
+        self.mail_client = build_admin_client()
+        self.mail_client.preflight_check = MagicMock()
+        self.domain = 'customdomain.com'
+
+    def test_deletes_dkim_signatures_before_domain(self):
+        """Unlike the legacy client, delete_domain also calls delete_dkim."""
+        manager = MagicMock()
+        manager.get_domain.return_value = MagicMock(id='a')
+
+        with (
+            patch.object(self.mail_client, 'get_domain', manager.get_domain),
+            patch.object(self.mail_client, 'delete_dkim', manager.delete_dkim),
+            patch.object(self.mail_client, '_handle_destroy', manager._handle_destroy),
+        ):
+            self.assertIsNone(self.mail_client.delete_domain(self.domain))
+
+        self.assertEqual(
+            [
+                call.get_domain(self.domain),
+                call.delete_dkim(self.domain),
+                call._handle_destroy(StalwartMethods.DOMAIN, 'a'),
+            ],
+            manager.mock_calls,
+        )
+
+    def test_not_found_raises_domain_not_found(self):
+        with (
+            patch.object(self.mail_client, 'get_domain', side_effect=DomainNotFoundError(self.domain)),
+            patch.object(self.mail_client, 'delete_dkim') as delete_dkim_mock,
+            patch.object(self.mail_client, '_handle_destroy') as handle_destroy_mock,
+        ):
+            with self.assertRaises(DomainNotFoundError):
+                self.mail_client.delete_domain(self.domain)
+
+        delete_dkim_mock.assert_not_called()
+        handle_destroy_mock.assert_not_called()
+
+    def test_domain_without_id_raises_domain_not_found(self):
+        with (
+            patch.object(self.mail_client, 'get_domain', return_value=MagicMock(id=None)),
+            patch.object(self.mail_client, 'delete_dkim') as delete_dkim_mock,
+            patch.object(self.mail_client, '_handle_destroy') as handle_destroy_mock,
+        ):
+            with self.assertRaises(DomainNotFoundError):
+                self.mail_client.delete_domain(self.domain)
+
+        delete_dkim_mock.assert_not_called()
+        handle_destroy_mock.assert_not_called()

@@ -6,7 +6,12 @@ from django.test import SimpleTestCase, override_settings, TestCase
 from thunderbird_accounts.mail.clients import DomainVerificationErrors
 from thunderbird_accounts.mail.clients.mail_client_legacy import MailClientLegacy as MailClient
 from thunderbird_accounts.mail.clients.mail_client_interface import DkimSignatureStage
-from thunderbird_accounts.mail.exceptions import FailedToCreateDKIM, FailedToReloadStalwart, StalwartError
+from thunderbird_accounts.mail.exceptions import (
+    DomainNotFoundError,
+    FailedToCreateDKIM,
+    FailedToReloadStalwart,
+    StalwartError,
+)
 
 
 @override_settings(
@@ -553,6 +558,44 @@ class TestMailClientDeleteDkim(TestCase):
 
         with self.assertRaises(requests.RequestException):
             self.mail_client.delete_dkim(self.domain)
+
+
+class TestMailClientDeleteDomain(TestCase):
+    def setUp(self):
+        self.mail_client = MailClient()
+        self.domain = 'customdomain.com'
+
+    def _build_response(self, data: dict) -> requests.Response:
+        response = requests.Response()
+        response.status_code = 200
+        response._content = bytes(json.dumps(data), 'utf-8')
+        return response
+
+    @patch.object(MailClient, 'delete_dkim')
+    @patch('requests.delete')
+    def test_success(self, requests_delete_mock: MagicMock, mock_delete_dkim: MagicMock):
+        """Only the domain principal is deleted; delete_dkim is not called."""
+        requests_delete_mock.return_value = self._build_response({'data': None})
+
+        self.assertIsNone(self.mail_client.delete_domain(self.domain))
+
+        requests_delete_mock.assert_called_once()
+        self.assertTrue(requests_delete_mock.call_args[0][0].endswith(f'/principal/{self.domain}'))
+        mock_delete_dkim.assert_not_called()
+
+    @patch('requests.delete')
+    def test_not_found_raises_domain_not_found(self, requests_delete_mock: MagicMock):
+        requests_delete_mock.return_value = self._build_response({'error': 'notFound'})
+
+        with self.assertRaises(DomainNotFoundError):
+            self.mail_client.delete_domain(self.domain)
+
+    @patch('requests.delete')
+    def test_unexpected_error_raises_runtime_error(self, requests_delete_mock: MagicMock):
+        requests_delete_mock.return_value = self._build_response({'error': 'unsupported'})
+
+        with self.assertLogs(level='ERROR'), self.assertRaises(RuntimeError):
+            self.mail_client.delete_domain(self.domain)
 
 
 @override_settings(

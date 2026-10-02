@@ -11,7 +11,9 @@ from thunderbird_accounts.authentication.models import User
 from thunderbird_accounts.core.tests.utils import oidc_force_login
 from thunderbird_accounts.legal.models import LegalDocument, LegalDocumentResponse
 from thunderbird_accounts.legal.views import _read_legal_content
-from thunderbird_accounts.mail.models import Account, Email
+from thunderbird_accounts.mail import tasks as mail_tasks
+from thunderbird_accounts.mail.clients import MailClient
+from thunderbird_accounts.mail.models import Account, Domain, Email
 from thunderbird_accounts.subscription.models import Subscription
 
 
@@ -469,6 +471,27 @@ class DeclineLegalDocsDeleteUserTestCase(LegalDocCleanSlateTestCase):
             self.user.refresh_from_db()
 
         self.assertFalse(LegalDocumentResponse.objects.filter(user_id=self.user.pk).exists())
+
+    @patch.object(mail_tasks.delete_hosted_dkim_dns_records, 'delay')
+    @patch.object(MailClient, 'delete_dkim')
+    @patch.object(MailClient, 'delete_domain')
+    def test_cleans_up_custom_domain(
+        self, mock_delete_domain, mock_delete_dkim, mock_delete_hosted_dkim, mock_kc_request, mock_delete_principal
+    ):
+        Domain.objects.create(
+            name='customdomain.com', user=self.user, stalwart_id='domain-id', status=Domain.DomainStatus.VERIFIED
+        )
+
+        oidc_force_login(self.client, self.user)
+        payload = json.dumps({})
+        self.client.post(self.url, data=payload, content_type='application/json')
+
+        mock_delete_domain.assert_called_once_with('customdomain.com')
+        mock_delete_dkim.assert_called_once_with('customdomain.com')
+        mock_delete_hosted_dkim.assert_called_once_with('customdomain.com')
+
+        with self.assertRaises(User.DoesNotExist):
+            self.user.refresh_from_db()
 
     @patch('thunderbird_accounts.authentication.utils.sentry_sdk')
     def test_still_deletes_db_user_on_keycloak_failure(self, mock_sentry, mock_kc_request, mock_delete_principal):
