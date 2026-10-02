@@ -144,6 +144,8 @@ def delete_user_data(user) -> list[str]:
     from thunderbird_accounts.authentication.clients import KeycloakClient
     from thunderbird_accounts.authentication.exceptions import DeleteUserError
     from thunderbird_accounts.mail.clients import MailClient
+    from thunderbird_accounts.mail.exceptions import CustomDomainCleanupError
+    from thunderbird_accounts.mail.utils import capture_domain_exception, delete_custom_domain_resources
 
     errors = []
 
@@ -159,6 +161,13 @@ def delete_user_data(user) -> list[str]:
             MailClient().delete_account(user.stalwart_primary_email)
         except Exception as ex:
             sentry_sdk.capture_exception(ex)
+            errors.append(f'Stalwart: {ex}')
+
+    for domain in user.domains.all():
+        try:
+            delete_custom_domain_resources(domain, is_migrated=user.is_migrated)
+        except CustomDomainCleanupError as ex:
+            capture_domain_exception(ex.__cause__, domain, phase=ex.phase)
             errors.append(f'Stalwart: {ex}')
 
     if errors:

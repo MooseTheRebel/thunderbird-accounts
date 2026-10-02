@@ -631,7 +631,8 @@ class AdminDeleteUserCustomDomainTestCase(TestCase):
     ):
         request = self._build_fake_request()
 
-        CustomUserAdmin(User, AdminSite()).delete_model(request, self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            CustomUserAdmin(User, AdminSite()).delete_model(request, self.user)
 
         mock_delete_user.assert_called_once_with(self.user.oidc_id)
         mock_delete_domain.assert_called_once_with('customdomain.com')
@@ -646,9 +647,10 @@ class AdminDeleteUserCustomDomainTestCase(TestCase):
         other_user = self._create_user('other', 'othercustomdomain.com')
         domain_names = {'customdomain.com', 'othercustomdomain.com'}
 
-        CustomUserAdmin(User, AdminSite()).delete_queryset(
-            self._build_fake_request(), User.objects.filter(pk__in=[self.user.pk, other_user.pk])
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            CustomUserAdmin(User, AdminSite()).delete_queryset(
+                self._build_fake_request(), User.objects.filter(pk__in=[self.user.pk, other_user.pk])
+            )
 
         self.assertEqual(domain_names, {c.args[0] for c in mock_delete_domain.call_args_list})
         self.assertEqual(domain_names, {c.args[0] for c in mock_delete_dkim.call_args_list})

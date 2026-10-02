@@ -709,7 +709,8 @@ class RemoveCustomDomainTestCase(TestCase):
             content_type='application/json',
         )
         request.user = self.user
-        return remove_custom_domain(request)
+        with self.captureOnCommitCallbacks(execute=True):
+            return remove_custom_domain(request)
 
     @patch('thunderbird_accounts.mail.views.mail_tasks.delete_hosted_dkim_dns_records.delay')
     @patch('thunderbird_accounts.mail.views.MailClient')

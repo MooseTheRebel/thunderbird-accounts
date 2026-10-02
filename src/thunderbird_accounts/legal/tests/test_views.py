@@ -484,7 +484,8 @@ class DeclineLegalDocsDeleteUserTestCase(LegalDocCleanSlateTestCase):
 
         oidc_force_login(self.client, self.user)
         payload = json.dumps({})
-        self.client.post(self.url, data=payload, content_type='application/json')
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(self.url, data=payload, content_type='application/json')
 
         mock_delete_domain.assert_called_once_with('customdomain.com')
         mock_delete_dkim.assert_called_once_with('customdomain.com')

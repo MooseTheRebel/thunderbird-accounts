@@ -1,6 +1,7 @@
 from unittest.mock import call, patch
 
 from django.conf import settings
+from django.db import transaction
 from django.test import TestCase, override_settings
 
 from thunderbird_accounts.authentication.clients import KeycloakClient
@@ -303,7 +304,8 @@ class DeleteUserDataTestCase(TestCase):
 
     def _delete_user_data(self):
         # Fetch a fresh instance so the cached ``is_migrated`` reflects any settings override.
-        return delete_user_data(User.objects.get(pk=self.user.pk))
+        with self.captureOnCommitCallbacks(execute=True):
+            return delete_user_data(User.objects.get(pk=self.user.pk))
 
     def _assert_user_deleted(self):
         self.assertFalse(User.objects.filter(pk=self.user.pk).exists())
@@ -455,7 +457,7 @@ class DeleteUserDataTestCase(TestCase):
         self.mock_delete_account.assert_called_once_with(self.user.username)
         self._assert_user_deleted()
 
-    def test_cloudflare_queue_failure_is_reported_and_other_cleanup_continues(self):
+    def test_cloudflare_queue_failure_is_logged_and_other_cleanup_continues(self):
         failing_domain = self._create_domain('customdomain.com')
         other_domain = self._create_domain('othercustomdomain.com')
 
@@ -468,13 +470,24 @@ class DeleteUserDataTestCase(TestCase):
         with self.assertLogs(level='ERROR'):
             errors = self._delete_user_data()
 
-        self.assertEqual(1, len(errors))
-        self.assertIn(failing_domain.name, errors[0])
+        self.assertEqual([], errors)
         self.assertIn(call(other_domain.name), self.mock_delete_domain.call_args_list)
         self.assertIn(call(other_domain.name), self.mock_delete_hosted_dkim_dns_records.call_args_list)
         self.mock_delete_keycloak_user.assert_called_once_with(self.user.oidc_id)
         self.mock_delete_account.assert_called_once_with(self.user.username)
         self._assert_user_deleted()
+
+    def test_rolled_back_deletion_does_not_delete_cloudflare_records(self):
+        self._create_domain()
+
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertRaises(RuntimeError), transaction.atomic():
+                delete_user_data(User.objects.get(pk=self.user.pk))
+                raise RuntimeError('rollback')
+
+        self.assertEqual([], callbacks)
+        self.mock_delete_hosted_dkim_dns_records.assert_not_called()
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
 
     def test_keycloak_failure_does_not_skip_domain_cleanup(self):
         domain = self._create_domain()
