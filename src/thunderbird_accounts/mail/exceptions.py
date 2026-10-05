@@ -45,6 +45,19 @@ class DomainNotFoundError(StalwartError):
         return f'DomainNotFoundError: {self.domain}'
 
 
+class CustomDomainCleanupError(RuntimeError):
+    domain: str
+    phase: str  # Phase of cleanup where exception happened.
+
+    def __init__(self, domain: str, phase: str):
+        super().__init__(domain, phase)
+        self.domain = domain
+        self.phase = phase
+
+    def __str__(self):
+        return f'CustomDomainCleanupError: {self.phase} failed for {self.domain}: {self.__cause__}'
+
+
 class AccountNotFoundError(StalwartError):
     """Raise when an individual is not found in Stalwart"""
 

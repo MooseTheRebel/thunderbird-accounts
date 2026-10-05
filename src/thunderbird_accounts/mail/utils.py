@@ -11,10 +11,17 @@ from django.core.validators import EmailValidator
 from django.contrib.auth.hashers import make_password, identify_hasher
 from django.utils.translation import gettext_lazy as _
 from django.conf import settings
+from django.db import transaction
 
-from thunderbird_accounts.mail.exceptions import EmailNotValidError, AccountNotFoundError, InvalidJMapResponseError
+from thunderbird_accounts.mail.exceptions import (
+    AccountNotFoundError,
+    CustomDomainCleanupError,
+    DomainNotFoundError,
+    EmailNotValidError,
+    InvalidJMapResponseError,
+)
 from thunderbird_accounts.authentication.models import User
-from thunderbird_accounts.mail.models import Account
+from thunderbird_accounts.mail.models import Account, Domain
 from thunderbird_accounts.mail import tasks
 
 
@@ -281,3 +288,39 @@ def is_address_taken(email_address: str, check_remote: bool = True) -> bool:
 
 def update_quota_on_stalwart_account(user: User, quota: Optional[int]):
     tasks.update_quota_on_stalwart_account.delay(username=user.username, quota=quota)
+
+
+def capture_domain_exception(exception: Exception, domain: Domain, *, phase: str):
+    sentry_sdk.set_context(
+        'domain',
+        {
+            'phase': phase,
+            'domain_name': domain.name,
+            'domain_status': domain.status,
+        },
+    )
+    sentry_sdk.capture_exception(exception)
+
+
+def delete_custom_domain_resources(domain: Domain, *, is_migrated: bool, mail_client=None):
+    phase = 'init_mail_client'
+    try:
+        mail_client = mail_client or MailClient()
+
+        if domain.stalwart_id or is_migrated:
+            phase = 'delete_stalwart_domain'
+            try:
+                mail_client.delete_domain(domain.name)
+            except DomainNotFoundError as ex:
+                # Already gone from Stalwart, so carry on with the rest of the cleanup
+                capture_domain_exception(ex, domain, phase='delete_stalwart_domain_not_found')
+
+        if not is_migrated:
+            phase = 'delete_dkim'
+            mail_client.delete_dkim(domain.name)
+    except Exception as ex:
+        raise CustomDomainCleanupError(domain.name, phase) from ex
+
+    # Queue after commit so a rolled back deletion doesn't also remove the DNS records
+    domain_name = domain.name
+    transaction.on_commit(lambda: tasks.delete_hosted_dkim_dns_records.delay(domain_name), robust=True)

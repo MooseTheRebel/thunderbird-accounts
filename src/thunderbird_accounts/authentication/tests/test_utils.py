@@ -1,8 +1,18 @@
+from unittest.mock import call, patch
+
+from django.conf import settings
+from django.db import transaction
 from django.test import TestCase, override_settings
 
+from thunderbird_accounts.authentication.clients import KeycloakClient
+from thunderbird_accounts.authentication.exceptions import DeleteUserError
 from thunderbird_accounts.authentication.models import AllowListEntry, User, UsernameBlockListEntry
 from thunderbird_accounts.authentication.reserved import is_reserved
-from thunderbird_accounts.authentication.utils import is_email_in_allow_list
+from thunderbird_accounts.authentication.utils import delete_user_data, is_email_in_allow_list
+from thunderbird_accounts.mail import tasks as mail_tasks
+from thunderbird_accounts.mail.clients import MailClient
+from thunderbird_accounts.mail.exceptions import DomainNotFoundError
+from thunderbird_accounts.mail.models import Account, Domain, Email
 
 
 class IsReservedUnitTests(TestCase):
@@ -257,3 +267,236 @@ class IsEmailInAllowListUnitTests(TestCase):
     @override_settings(USE_ALLOW_LIST=False)
     def test_returns_true_when_allow_list_is_disabled(self):
         self.assertTrue(is_email_in_allow_list('not-listed@example.com'))
+
+
+class DeleteUserDataTestCase(TestCase):
+    """Deleting a user must also clean up the external resources behind their custom domains:
+    the Stalwart domain, its DKIM signatures, and the hosted DKIM TXT records in Cloudflare."""
+
+    def setUp(self):
+        self.user = User.objects.create(
+            username=f'test@{settings.PRIMARY_EMAIL_DOMAIN}',
+            email='test@example.net',
+            oidc_id='delete-user-data-oidc',
+        )
+        self.account = Account.objects.create(name=self.user.username, user=self.user)
+        Email.objects.create(address=self.user.username, type=Email.EmailType.PRIMARY, account=self.account)
+
+        # Patch at the class/task level so these hold wherever MailClient or the task are imported from.
+        patchers = {
+            'mock_delete_keycloak_user': patch.object(KeycloakClient, 'delete_user'),
+            'mock_delete_account': patch.object(MailClient, 'delete_account'),
+            'mock_delete_domain': patch.object(MailClient, 'delete_domain'),
+            'mock_delete_dkim': patch.object(MailClient, 'delete_dkim'),
+            'mock_delete_hosted_dkim_dns_records': patch.object(mail_tasks.delete_hosted_dkim_dns_records, 'delay'),
+        }
+        for name, patcher in patchers.items():
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def _create_domain(self, name='customdomain.com', status=Domain.DomainStatus.VERIFIED):
+        return Domain.objects.create(
+            name=name,
+            user=self.user,
+            stalwart_id='domain-id' if status == Domain.DomainStatus.VERIFIED else None,
+            status=status,
+        )
+
+    def _delete_user_data(self):
+        # Fetch a fresh instance so the cached ``is_migrated`` reflects any settings override.
+        with self.captureOnCommitCallbacks(execute=True):
+            return delete_user_data(User.objects.get(pk=self.user.pk))
+
+    def _assert_user_deleted(self):
+        self.assertFalse(User.objects.filter(pk=self.user.pk).exists())
+        self.assertFalse(Domain.objects.filter(user_id=self.user.pk).exists())
+
+    def test_non_migrated_user_verified_domain_deletes_stalwart_domain_dkim_and_cloudflare_records(self):
+        domain = self._create_domain()
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_domain.assert_called_once_with(domain.name)
+        self.mock_delete_dkim.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()
+
+    @override_settings(STALWART_ADMIN_API_USE_JMAP=True)
+    def test_migrated_user_verified_domain_deletes_stalwart_domain_and_cloudflare_records(self):
+        """The JMAP client's delete_domain also removes the domain's DKIM signatures."""
+        domain = self._create_domain()
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_domain.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()
+
+    @override_settings(STALWART_ADMIN_API_USE_JMAP=True)
+    def test_migrated_user_pending_domain_deletes_stalwart_domain_and_cloudflare_records(self):
+        """Migrated users get a disabled Stalwart domain as soon as the domain is added, before verification."""
+        domain = self._create_domain(status=Domain.DomainStatus.PENDING)
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_domain.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()
+
+    def test_non_migrated_user_pending_domain_deletes_dkim_and_cloudflare_records(self):
+        """DKIM signatures are created and Cloudflare records queued when the domain is added, before verification."""
+        domain = self._create_domain(status=Domain.DomainStatus.PENDING)
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_dkim.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()
+
+    def test_every_custom_domain_is_cleaned_up(self):
+        domain_names = {
+            self._create_domain('customdomain.com').name,
+            self._create_domain('othercustomdomain.com').name,
+        }
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.assertEqual(domain_names, {c.args[0] for c in self.mock_delete_domain.call_args_list})
+        self.assertEqual(domain_names, {c.args[0] for c in self.mock_delete_dkim.call_args_list})
+        self.assertEqual(domain_names, {c.args[0] for c in self.mock_delete_hosted_dkim_dns_records.call_args_list})
+        self._assert_user_deleted()
+
+    def test_user_without_custom_domains_only_deletes_keycloak_user_and_stalwart_account(self):
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_keycloak_user.assert_called_once_with(self.user.oidc_id)
+        self.mock_delete_account.assert_called_once_with(self.user.username)
+        self.mock_delete_domain.assert_not_called()
+        self.mock_delete_dkim.assert_not_called()
+        self.mock_delete_hosted_dkim_dns_records.assert_not_called()
+        self._assert_user_deleted()
+
+    def test_shared_domains_are_never_cleaned_up(self):
+        """Shared domains have Stalwart domains and DKIM signatures used by every user."""
+        for shared_domain in settings.ALLOWED_EMAIL_DOMAINS[1:]:
+            Email.objects.create(
+                address=f'test@{shared_domain}',
+                type=Email.EmailType.ALIAS,
+                account=self.account,
+            )
+        domain = self._create_domain()
+
+        self._delete_user_data()
+
+        cleanup_mocks = [self.mock_delete_domain, self.mock_delete_dkim, self.mock_delete_hosted_dkim_dns_records]
+        for cleanup_mock in cleanup_mocks:
+            cleaned_up = {c.args[0] for c in cleanup_mock.call_args_list}
+            self.assertEqual({domain.name}, cleaned_up)
+            self.assertFalse(cleaned_up & set(settings.ALLOWED_EMAIL_DOMAINS))
+
+    def test_domains_are_cleaned_up_before_local_rows_are_deleted(self):
+        domain = self._create_domain()
+        domain_existed_during_cleanup = []
+        self.mock_delete_domain.side_effect = lambda name: domain_existed_during_cleanup.append(
+            Domain.objects.filter(name=name).exists()
+        )
+
+        self._delete_user_data()
+
+        self.assertEqual([True], domain_existed_during_cleanup)
+        self.assertFalse(Domain.objects.filter(name=domain.name).exists())
+
+    def test_domain_cleanup_does_not_depend_on_stalwart_account(self):
+        self.account.delete()
+        domain = self._create_domain()
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_account.assert_not_called()
+        self.mock_delete_domain.assert_called_once_with(domain.name)
+        self.mock_delete_dkim.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()
+
+    def test_domain_already_missing_from_stalwart_is_not_an_error(self):
+        domain = self._create_domain()
+        self.mock_delete_domain.side_effect = DomainNotFoundError(domain.name)
+
+        errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.mock_delete_dkim.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()
+
+    def test_stalwart_domain_failure_is_reported_and_other_cleanup_continues(self):
+        failing_domain = self._create_domain('customdomain.com')
+        other_domain = self._create_domain('othercustomdomain.com')
+
+        def delete_domain(name):
+            if name == failing_domain.name:
+                raise RuntimeError('stalwart unavailable')
+
+        self.mock_delete_domain.side_effect = delete_domain
+
+        with self.assertLogs(level='ERROR'):
+            errors = self._delete_user_data()
+
+        self.assertEqual(1, len(errors))
+        self.assertIn(failing_domain.name, errors[0])
+        self.assertIn(call(other_domain.name), self.mock_delete_domain.call_args_list)
+        self.assertIn(call(other_domain.name), self.mock_delete_hosted_dkim_dns_records.call_args_list)
+        self.mock_delete_keycloak_user.assert_called_once_with(self.user.oidc_id)
+        self.mock_delete_account.assert_called_once_with(self.user.username)
+        self._assert_user_deleted()
+
+    def test_cloudflare_queue_failure_is_logged_and_other_cleanup_continues(self):
+        failing_domain = self._create_domain('customdomain.com')
+        other_domain = self._create_domain('othercustomdomain.com')
+
+        def queue_delete(name):
+            if name == failing_domain.name:
+                raise RuntimeError('broker unavailable')
+
+        self.mock_delete_hosted_dkim_dns_records.side_effect = queue_delete
+
+        with self.assertLogs(level='ERROR'):
+            errors = self._delete_user_data()
+
+        self.assertEqual([], errors)
+        self.assertIn(call(other_domain.name), self.mock_delete_domain.call_args_list)
+        self.assertIn(call(other_domain.name), self.mock_delete_hosted_dkim_dns_records.call_args_list)
+        self.mock_delete_keycloak_user.assert_called_once_with(self.user.oidc_id)
+        self.mock_delete_account.assert_called_once_with(self.user.username)
+        self._assert_user_deleted()
+
+    def test_rolled_back_deletion_does_not_delete_cloudflare_records(self):
+        self._create_domain()
+
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            with self.assertRaises(RuntimeError), transaction.atomic():
+                delete_user_data(User.objects.get(pk=self.user.pk))
+                raise RuntimeError('rollback')
+
+        self.assertEqual([], callbacks)
+        self.mock_delete_hosted_dkim_dns_records.assert_not_called()
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+
+    def test_keycloak_failure_does_not_skip_domain_cleanup(self):
+        domain = self._create_domain()
+        self.mock_delete_keycloak_user.side_effect = DeleteUserError(error='boom', oidc_id=self.user.oidc_id)
+
+        with self.assertLogs(level='ERROR'):
+            errors = self._delete_user_data()
+
+        self.assertEqual(1, len(errors))
+        self.mock_delete_domain.assert_called_once_with(domain.name)
+        self.mock_delete_hosted_dkim_dns_records.assert_called_once_with(domain.name)
+        self._assert_user_deleted()

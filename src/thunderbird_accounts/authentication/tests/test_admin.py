@@ -2,7 +2,10 @@ from thunderbird_accounts.mail.exceptions import AccountNotFoundError
 from unittest.mock import MagicMock, patch
 
 from django.conf import settings
+from django.contrib import messages
 from django.contrib.admin import AdminSite
+from django.contrib.messages import get_messages
+from django.contrib.messages.storage.fallback import FallbackStorage
 from django.http import HttpRequest, QueryDict
 from django.test import TestCase
 from django.template.response import TemplateResponse
@@ -12,9 +15,11 @@ from requests import Response
 from thunderbird_accounts.authentication.admin.actions import admin_reset_totp_credentials
 from thunderbird_accounts.authentication.admin import CustomUserAdmin
 from thunderbird_accounts.authentication.admin.actions import admin_backfill_recovery_email
-from thunderbird_accounts.authentication.clients import RequestMethods
+from thunderbird_accounts.authentication.clients import KeycloakClient, RequestMethods
 from thunderbird_accounts.authentication.models import User
-from thunderbird_accounts.mail.models import Account, Email
+from thunderbird_accounts.mail import tasks as mail_tasks
+from thunderbird_accounts.mail.clients import MailClient
+from thunderbird_accounts.mail.models import Account, Domain, Email
 from thunderbird_accounts.core.tests.utils import build_keycloak_success_response
 
 FAKE_OIDC_UUID = '39a7b5e8-7a64-45e3-acf1-ca7d314bfcec'
@@ -593,6 +598,80 @@ class AdminDeleteUserTestCase(TestCase):
         self.assertEqual(method, RequestMethods.DELETE)
 
         mock_delete_principal.assert_not_called()
+
+
+@patch.object(mail_tasks.delete_hosted_dkim_dns_records, 'delay')
+@patch.object(MailClient, 'delete_dkim')
+@patch.object(MailClient, 'delete_domain')
+@patch.object(MailClient, 'delete_account')
+@patch.object(KeycloakClient, 'delete_user')
+class AdminDeleteUserCustomDomainTestCase(TestCase):
+    """Deleting a user from the admin also cleans up the external resources behind their custom domains."""
+
+    def setUp(self):
+        self.user = self._create_user('test', 'customdomain.com')
+
+    def _create_user(self, username, domain_name):
+        user = User.objects.create(
+            username=f'{username}@{settings.PRIMARY_EMAIL_DOMAIN}',
+            email=f'{username}@example.net',
+            oidc_id=f'oidc-{username}',
+        )
+        Domain.objects.create(name=domain_name, user=user, stalwart_id='domain-id', status=Domain.DomainStatus.VERIFIED)
+        return user
+
+    def _build_fake_request(self):
+        request = HttpRequest()
+        request.session = {}
+        request._messages = FallbackStorage(request)
+        return request
+
+    def test_delete_model_cleans_up_custom_domain(
+        self, mock_delete_user, mock_delete_account, mock_delete_domain, mock_delete_dkim, mock_delete_hosted_dkim
+    ):
+        request = self._build_fake_request()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            CustomUserAdmin(User, AdminSite()).delete_model(request, self.user)
+
+        mock_delete_user.assert_called_once_with(self.user.oidc_id)
+        mock_delete_domain.assert_called_once_with('customdomain.com')
+        mock_delete_dkim.assert_called_once_with('customdomain.com')
+        mock_delete_hosted_dkim.assert_called_once_with('customdomain.com')
+        self.assertFalse(User.objects.filter(pk=self.user.pk).exists())
+        self.assertEqual([], list(get_messages(request)))
+
+    def test_delete_queryset_cleans_up_every_users_custom_domains(
+        self, mock_delete_user, mock_delete_account, mock_delete_domain, mock_delete_dkim, mock_delete_hosted_dkim
+    ):
+        other_user = self._create_user('other', 'othercustomdomain.com')
+        domain_names = {'customdomain.com', 'othercustomdomain.com'}
+
+        with self.captureOnCommitCallbacks(execute=True):
+            CustomUserAdmin(User, AdminSite()).delete_queryset(
+                self._build_fake_request(), User.objects.filter(pk__in=[self.user.pk, other_user.pk])
+            )
+
+        self.assertEqual(domain_names, {c.args[0] for c in mock_delete_domain.call_args_list})
+        self.assertEqual(domain_names, {c.args[0] for c in mock_delete_dkim.call_args_list})
+        self.assertEqual(domain_names, {c.args[0] for c in mock_delete_hosted_dkim.call_args_list})
+        self.assertFalse(User.objects.filter(pk__in=[self.user.pk, other_user.pk]).exists())
+
+    def test_delete_model_tells_admin_which_domain_needs_manual_cleanup(
+        self, mock_delete_user, mock_delete_account, mock_delete_domain, mock_delete_dkim, mock_delete_hosted_dkim
+    ):
+        mock_delete_domain.side_effect = RuntimeError('stalwart unavailable')
+        request = self._build_fake_request()
+
+        with self.assertLogs(level='ERROR'):
+            CustomUserAdmin(User, AdminSite()).delete_model(request, self.user)
+
+        admin_messages = list(get_messages(request))
+        error_messages = [str(m) for m in admin_messages if m.level == messages.ERROR]
+        self.assertEqual(1, len(error_messages))
+        self.assertIn('customdomain.com', error_messages[0])
+        self.assertIn(messages.WARNING, [m.level for m in admin_messages])
+        self.assertFalse(User.objects.filter(pk=self.user.pk).exists())
 
 
 @patch.object(CustomUserAdmin, 'message_user')
