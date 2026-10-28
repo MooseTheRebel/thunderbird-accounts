@@ -4,7 +4,6 @@ from django.utils.crypto import get_random_string
 from thunderbird_accounts.subscription.models import Plan, Subscription
 import json
 import requests
-from unittest import expectedFailure
 from unittest.mock import patch, Mock
 
 from django.conf import settings
@@ -985,13 +984,14 @@ class RemoveCustomDomainTestCase(TestCase):
         self.domain.status = Domain.DomainStatus.PENDING
         self.domain.save()
         mock_instance = Mock()
+        mock_instance.delete_domain.side_effect = DomainNotFoundError(self.domain.name)
         mock_mail_client_cls.return_value = mock_instance
 
         response = self._delete_domain()
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.content.decode()), {'success': True})
-        mock_instance.delete_domain.assert_not_called()
+        mock_instance.delete_domain.assert_called_once_with(self.domain.name)
         mock_instance.delete_dkim.assert_called_once_with(self.domain.name)
         mock_delete_hosted_dkim_dns_records.assert_called_once_with(self.domain.name)
         self.assertFalse(Domain.objects.filter(name=self.domain.name).exists())
@@ -1018,7 +1018,6 @@ class RemoveCustomDomainTestCase(TestCase):
         mock_delete_hosted_dkim_dns_records.assert_called_once_with(self.domain.name)
         self.assertFalse(Domain.objects.filter(name=self.domain.name).exists())
 
-    @expectedFailure
     @override_settings(STALWART_ADMIN_API_USE_JMAP=False)
     @patch.object(mail_tasks.delete_hosted_dkim_dns_records, 'delay')
     @patch.object(MailClient, 'delete_dkim')
@@ -1037,6 +1036,25 @@ class RemoveCustomDomainTestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         mock_delete_domain.assert_called_once_with('customdomain.com')
+
+    @patch('thunderbird_accounts.mail.views.mail_tasks.delete_hosted_dkim_dns_records.delay')
+    @patch('thunderbird_accounts.mail.views.MailClient')
+    def test_failed_cleanup_keeps_local_domain_for_retry(
+        self,
+        mock_mail_client_cls,
+        mock_delete_hosted_dkim_dns_records,
+    ):
+        mock_instance = Mock()
+        mock_instance.delete_domain.side_effect = RuntimeError('boom')
+        mock_mail_client_cls.return_value = mock_instance
+
+        response = self._delete_domain()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(json.loads(response.content.decode())['success'])
+        mock_instance.delete_dkim.assert_called_once_with(self.domain.name)
+        mock_delete_hosted_dkim_dns_records.assert_called_once_with(self.domain.name)
+        self.assertTrue(Domain.objects.filter(name=self.domain.name).exists())
 
     @patch('thunderbird_accounts.mail.views.mail_tasks.delete_hosted_dkim_dns_records.delay')
     @patch('thunderbird_accounts.mail.views.MailClient')
