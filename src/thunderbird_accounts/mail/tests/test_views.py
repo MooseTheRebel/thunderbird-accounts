@@ -14,7 +14,8 @@ from django.utils.translation import gettext_lazy as _
 
 from thunderbird_accounts.authentication.models import User
 from thunderbird_accounts.core.tests.utils import oidc_force_login
-from thunderbird_accounts.mail.clients import DomainVerificationErrors, StaleDNSRecordCode
+from thunderbird_accounts.mail import tasks as mail_tasks
+from thunderbird_accounts.mail.clients import DomainVerificationErrors, MailClient, StaleDNSRecordCode
 from thunderbird_accounts.mail.models import Account, Domain, Email
 from thunderbird_accounts.mail.views import (
     AdminStalwartList,
@@ -983,13 +984,14 @@ class RemoveCustomDomainTestCase(TestCase):
         self.domain.status = Domain.DomainStatus.PENDING
         self.domain.save()
         mock_instance = Mock()
+        mock_instance.delete_domain.side_effect = DomainNotFoundError(self.domain.name)
         mock_mail_client_cls.return_value = mock_instance
 
         response = self._delete_domain()
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.content.decode()), {'success': True})
-        mock_instance.delete_domain.assert_not_called()
+        mock_instance.delete_domain.assert_called_once_with(self.domain.name)
         mock_instance.delete_dkim.assert_called_once_with(self.domain.name)
         mock_delete_hosted_dkim_dns_records.assert_called_once_with(self.domain.name)
         self.assertFalse(Domain.objects.filter(name=self.domain.name).exists())
@@ -1015,6 +1017,44 @@ class RemoveCustomDomainTestCase(TestCase):
         mock_instance.delete_dkim.assert_not_called()
         mock_delete_hosted_dkim_dns_records.assert_called_once_with(self.domain.name)
         self.assertFalse(Domain.objects.filter(name=self.domain.name).exists())
+
+    @override_settings(STALWART_ADMIN_API_USE_JMAP=False)
+    @patch.object(mail_tasks.delete_hosted_dkim_dns_records, 'delay')
+    @patch.object(MailClient, 'delete_dkim')
+    @patch.object(MailClient, 'delete_domain')
+    def test_verified_domain_without_stalwart_id_deletes_stalwart_domain(
+        self,
+        mock_delete_domain,
+        mock_delete_dkim,
+        mock_delete_hosted_dkim_dns_records,
+    ):
+        self.domain.name = 'customdomain.com'
+        self.domain.stalwart_id = None
+        self.domain.save()
+
+        response = self._delete_domain()
+
+        self.assertEqual(response.status_code, 200)
+        mock_delete_domain.assert_called_once_with('customdomain.com')
+
+    @patch('thunderbird_accounts.mail.views.mail_tasks.delete_hosted_dkim_dns_records.delay')
+    @patch('thunderbird_accounts.mail.views.MailClient')
+    def test_failed_cleanup_keeps_local_domain_for_retry(
+        self,
+        mock_mail_client_cls,
+        mock_delete_hosted_dkim_dns_records,
+    ):
+        mock_instance = Mock()
+        mock_instance.delete_domain.side_effect = RuntimeError('boom')
+        mock_mail_client_cls.return_value = mock_instance
+
+        response = self._delete_domain()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(json.loads(response.content.decode())['success'])
+        mock_instance.delete_dkim.assert_called_once_with(self.domain.name)
+        mock_delete_hosted_dkim_dns_records.assert_called_once_with(self.domain.name)
+        self.assertTrue(Domain.objects.filter(name=self.domain.name).exists())
 
     @patch('thunderbird_accounts.mail.views.mail_tasks.delete_hosted_dkim_dns_records.delay')
     @patch('thunderbird_accounts.mail.views.MailClient')
